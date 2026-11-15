@@ -197,6 +197,7 @@ if(CLIPPER2_EXAMPLES)
     set(EXAMPLES
       Benchmarks
       Inflate
+      MapOverlayBench
       MemLeakTest
       PolygonSamples
       RandomClipping

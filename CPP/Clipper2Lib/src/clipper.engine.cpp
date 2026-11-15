@@ -10,6 +10,7 @@
 #include "clipper2/clipper.engine.h"
 #include "clipper2/clipper.h"
 #include <stdexcept>
+#include <cstring>
 
 // https://github.com/AngusJohnson/Clipper2/discussions/334
 // #discussioncomment-4248602
@@ -24,6 +25,99 @@
 namespace Clipper2Lib {
 
   static const Rect64 invalid_rect = Rect64(false);
+
+  // ---------------------------------------------------------------------------
+  // Memory pools for the engine's hot allocation paths (Active, OutPt and
+  // OutRec objects). Recycling these small fixed-size objects through
+  // thread-local free lists removes most heap traffic from the scanline
+  // sweep, which really matters when boolean operations are queued
+  // back-to-back (eg map overlay and collision pre-processing batches).
+  // ---------------------------------------------------------------------------
+
+  template <typename T, size_t chunk_size>
+  class MemPool {
+    std::vector<std::unique_ptr<char[]>> chunks_;
+    void* free_list_ = nullptr;
+    size_t chunk_idx_ = 0;
+    size_t offset_ = 0;
+  public:
+    void* Allocate()
+    {
+      if (free_list_)
+      {
+        void* result = free_list_;
+        free_list_ = *static_cast<void**>(free_list_);
+        return result;
+      }
+      if (offset_ == chunk_size) { ++chunk_idx_; offset_ = 0; }
+      if (chunk_idx_ == chunks_.size())
+        chunks_.emplace_back(std::make_unique<char[]>(sizeof(T) * chunk_size));
+      return chunks_[chunk_idx_].get() + (offset_++) * sizeof(T);
+    }
+    void Deallocate(void* ptr)
+    {
+      *static_cast<void**>(ptr) = free_list_;
+      free_list_ = ptr;
+    }
+    //nb: only call this when no pooled objects are still in use
+    void Reset()
+    {
+      free_list_ = nullptr;
+      chunk_idx_ = 0;
+      offset_ = 0;
+    }
+  };
+
+  thread_local MemPool<Active, 1024> active_pool_;
+  thread_local MemPool<OutPt, 4096> outpt_pool_;
+  thread_local MemPool<OutRec, 1024> outrec_pool_;
+
+  //Pooled objects only ever live between ExecuteInternal() and CleanUp(),
+  //so the pools can be reset in bulk in CleanUp() rather than recycling
+  //each object individually. The depth counter makes this safe even when
+  //an execution is reentered from another thread-unaware callback (eg a
+  //ZCallback that itself performs clipping on the same thread).
+  thread_local int pool_exec_depth_ = 0;
+
+  inline void ResetMemPools()
+  {
+    active_pool_.Reset();
+    outpt_pool_.Reset();
+    outrec_pool_.Reset();
+  }
+
+  void* Active::operator new(std::size_t size)
+  {
+    (void)size;
+    return active_pool_.Allocate();
+  }
+
+  void Active::operator delete(void* ptr) noexcept
+  {
+    if (ptr) active_pool_.Deallocate(ptr);
+  }
+
+  void* OutPt::operator new(std::size_t size)
+  {
+    (void)size;
+    return outpt_pool_.Allocate();
+  }
+
+  void OutPt::operator delete(void* ptr) noexcept
+  {
+    if (ptr) outpt_pool_.Deallocate(ptr);
+  }
+
+  void* OutRec::operator new(std::size_t size)
+  {
+    (void)size;
+    return outrec_pool_.Allocate();
+  }
+
+  void OutRec::operator delete(void* ptr) noexcept
+  {
+    if (ptr) outrec_pool_.Deallocate(ptr);
+  }
 
   // Every closed path (ie polygon) is made up of a series of vertices forming edge 
   // 'bounds' that alternate between ascending bounds (containing edges going up 
@@ -193,25 +287,6 @@ namespace Clipper2Lib {
   }
 
 
-  inline Active* ExtractFromSEL(Active* ae)
-  {
-    Active* res = ae->next_in_sel;
-    if (res)
-      res->prev_in_sel = ae->prev_in_sel;
-    ae->prev_in_sel->next_in_sel = res;
-    return res;
-  }
-
-
-  inline void Insert1Before2InSEL(Active* ae1, Active* ae2)
-  {
-    ae1->prev_in_sel = ae2->prev_in_sel;
-    if (ae1->prev_in_sel)
-      ae1->prev_in_sel->next_in_sel = ae1;
-    ae1->next_in_sel = ae2;
-    ae2->prev_in_sel = ae1;
-  }
-
   inline bool IsMaxima(const Vertex& v)
   {
     return ((v.flags & VertexFlags::LocalMax) != VertexFlags::Empty);
@@ -319,11 +394,13 @@ namespace Clipper2Lib {
   }
 
 
-  bool IntersectListSort(const IntersectNode& a, const IntersectNode& b)
-  {
-    //note different inequality tests ...
-    return (a.pt.y == b.pt.y) ? (a.pt.x < b.pt.x) : (a.pt.y > b.pt.y);
-  }
+  struct IntersectListSorter {
+    inline bool operator()(const IntersectNode& a, const IntersectNode& b) const
+    {
+      //note different inequality tests ...
+      return (a.pt.y == b.pt.y) ? (a.pt.x < b.pt.x) : (a.pt.y > b.pt.y);
+    }
+  };
 
 
   inline void SetSides(OutRec& outrec, Active& start_edge, Active& end_edge)
@@ -752,24 +829,17 @@ namespace Clipper2Lib {
     Clear();
   }
 
-  void ClipperBase::DeleteEdges(Active*& e)
-  {
-    while (e)
-    {
-      Active* e2 = e;
-      e = e->next_in_ael;
-      delete e2;
-    }
-  }
-
   void ClipperBase::CleanUp()
   {
-    DeleteEdges(actives_);
-    scanline_list_ = std::priority_queue<int64_t>();
+    actives_ = nullptr;
+    scanline_list_.Clear();
     intersect_nodes_.clear();
     DisposeAllOutRecs();
     horz_seg_list_.clear();
     horz_join_list_.clear();
+    //all pooled objects (Active, OutPt, OutRec) are now dead,
+    //so recycle them in bulk rather than one at a time.
+    if (pool_exec_depth_ > 0 && --pool_exec_depth_ == 0) ResetMemPools();
   }
 
 
@@ -790,6 +860,10 @@ namespace Clipper2Lib {
       std::stable_sort(minima_list_.begin(), minima_list_.end(), LocMinSorter()); //#594
       minima_list_sorted_ = true;
     }
+    //nb: no scanline Y ordinate can exceed the largest local minima
+    //Y ordinate (see ScanlineQueue), so it's a safe anchor.
+    if (!minima_list_.empty())
+      scanline_list_.SetAnchor(minima_list_.front()->vertex->pt.y);
     LocalMinimaList::const_reverse_iterator i;
     for (i = minima_list_.rbegin(); i != minima_list_.rend(); ++i)
       InsertScanline((*i)->vertex->pt.y);
@@ -856,18 +930,13 @@ namespace Clipper2Lib {
 
   void ClipperBase::InsertScanline(int64_t y)
   {
-    scanline_list_.push(y);
+    scanline_list_.Push(y);
   }
 
 
   bool ClipperBase::PopScanline(int64_t& y)
   {
-    if (scanline_list_.empty()) return false;
-    y = scanline_list_.top();
-    scanline_list_.pop();
-    while (!scanline_list_.empty() && y == scanline_list_.top())
-      scanline_list_.pop();  // Pop duplicates.
-    return true;
+    return scanline_list_.Pop(y);
   }
 
 
@@ -882,8 +951,11 @@ namespace Clipper2Lib {
   {
     for (auto outrec : outrec_list_)
     {
-      if (outrec->pts) DisposeOutPts(outrec);
-      delete outrec;
+      //nb: OutPt objects aren't disposed individually here because
+      //they're recycled in bulk when the memory pools are reset in
+      //CleanUp(). And the OutRec memory itself is likewise recycled
+      //there, so only its destructor needs to be called explicitly.
+      outrec->~OutRec();
     }
     outrec_list_.resize(0);
   }
@@ -1154,7 +1226,7 @@ namespace Clipper2Lib {
   }
 
 
-  void ClipperBase::InsertLeftEdge(Active& e)
+  void ClipperBase::InsertLeftEdge(Active& e, Active* hint)
   {
     Active* e2;
     if (!actives_)
@@ -1172,7 +1244,11 @@ namespace Clipper2Lib {
     }
     else
     {
-      e2 = actives_;
+      //nb: when local minima are processed in batches at the same scanline
+      //(in ascending X order), the previous insertion is a safe place to
+      //start searching whenever it's strictly left of the newcomer, since
+      //curr_x is non-decreasing along the AEL.
+      e2 = (hint && hint->curr_x < e.curr_x) ? hint : actives_;
       while (e2->next_in_ael && IsValidAelOrder(*e2->next_in_ael, e))
         e2 = e2->next_in_ael;
       if (e2->join_with == JoinWith::Right)
@@ -1199,6 +1275,7 @@ namespace Clipper2Lib {
   {
     LocalMinima* local_minima;
     Active* left_bound, * right_bound;
+    Active* insert_hint = nullptr;
     //Add any local minima (if any) at BotY ...
     //nb: horizontal local minima edges should contain locMin.vertex.prev
 
@@ -1259,7 +1336,10 @@ namespace Clipper2Lib {
 
       bool contributing;
       left_bound->is_left_bound = true;
-      InsertLeftEdge(*left_bound);
+      InsertLeftEdge(*left_bound, insert_hint);
+      //nb: no edges are deleted from the AEL while local minima are
+      //being inserted, so this hint remains valid for the next insert.
+      insert_hint = left_bound;
 
       if (IsOpen(*left_bound))
       {
@@ -2099,18 +2179,23 @@ namespace Clipper2Lib {
   }
 
 
-  inline void ClipperBase::AdjustCurrXAndCopyToSEL(const int64_t top_y)
+  inline void ClipperBase::FillMergeArray(const int64_t top_y)
   {
+    merge_arr_.clear();
+    merge_sorted_ = true;
     Active* e = actives_;
-    sel_ = e;
+    int64_t prev_x = 0;
     while (e)
     {
-      e->prev_in_sel = e->prev_in_ael;
-      e->next_in_sel = e->next_in_ael;
-      e->jump = e->next_in_sel;
       // it is safe to ignore 'joined' edges here because
       // if necessary they will be split in IntersectEdges()
       e->curr_x = TopX(*e, top_y);
+      if (merge_sorted_)
+      {
+        if (e != actives_ && e->curr_x < prev_x) merge_sorted_ = false;
+        prev_x = e->curr_x;
+      }
+      merge_arr_.push_back(e);
       e = e->next_in_ael;
     }
   }
@@ -2120,6 +2205,7 @@ namespace Clipper2Lib {
     cliptype_ = ct;
     fillrule_ = fillrule;
     using_polytree_ = use_polytrees;
+    ++pool_exec_depth_;
     Reset();
     int64_t y;
     if (ct == ClipType::NoClip || !PopScanline(y)) return true;
@@ -2338,6 +2424,15 @@ namespace Clipper2Lib {
     if (BuildIntersectList(top_y))
     {
       ProcessIntersectList();
+      //restore curr_x (set to intersection points in ProcessIntersectList)
+      //to each edge's X ordinate at the top of the scanbeam. Doing this here
+      //means DoTopOfScanbeam() no longer needs to recompute curr_x for
+      //every active edge (see TopX), which is a significant saving.
+      for (const IntersectNode& node : intersect_nodes_)
+      {
+        node.edge1->curr_x = TopX(*node.edge1, top_y);
+        node.edge2->curr_x = TopX(*node.edge2, top_y);
+      }
       intersect_nodes_.clear();
     }
   }
@@ -2378,58 +2473,107 @@ namespace Clipper2Lib {
 
   bool ClipperBase::BuildIntersectList(const int64_t top_y)
   {
-    if (!actives_ || !actives_->next_in_ael) return false;
+    if (!actives_) return false;
 
     //Calculate edge positions at the top of the current scanbeam, and from this
     //we will determine the intersections required to reach these new positions.
-    AdjustCurrXAndCopyToSEL(top_y);
-    //Find all edge intersections in the current scanbeam using a stable merge
-    //sort that ensures only adjacent edges are intersecting. Intersect info is
-    //stored in FIntersectList ready to be processed in ProcessIntersectList.
-    //Re merge sorts see https://stackoverflow.com/a/46319131/359538
+    FillMergeArray(top_y);
+    const size_t edge_count = merge_arr_.size();
+    if (edge_count < 2 || merge_sorted_) return false;
 
-    Active* left = sel_, * right, * l_end, * r_end, * curr_base, * tmp;
+    //Find all edge intersections in the current scanbeam using a stable
+    //bottom-up merge sort that ensures only adjacent edges are intersecting.
+    //Intersect info is stored in intersect_nodes_ ready to be processed in
+    //ProcessIntersectList. This is an array based rewrite of the original
+    //linked-list merge sort (see https://stackoverflow.com/a/46319131/359538)
+    //that generates exactly the same intersect nodes in exactly the same
+    //order, but with much better cache performance.
 
-    while (left && left->jump)
+    if (merge_tmp_.size() < edge_count) merge_tmp_.resize(edge_count);
+    Active** src = merge_arr_.data();
+    Active** dst = merge_tmp_.data();
+
+    for (size_t width = 1; width < edge_count; width <<= 1)
     {
-      Active* prev_base = nullptr;
-      while (left && left->jump)
-      {
-        curr_base = left;
-        right = left->jump;
-        l_end = right;
-        r_end = right->jump;
-        left->jump = r_end;
-        while (left != l_end && right != r_end)
-        {
-          if (right->curr_x < left->curr_x)
-          {
-            tmp = right->prev_in_sel;
-            for (; ; )
-            {
-              AddNewIntersectNode(*tmp, *right, top_y);
-              if (tmp == left) break;
-              tmp = tmp->prev_in_sel;
-            }
+      const bool final_pass = (width << 1) >= edge_count;
 
-            tmp = right;
-            right = ExtractFromSEL(tmp);
-            l_end = right;
-            Insert1Before2InSEL(tmp, left);
-            if (left == curr_base)
-            {
-              curr_base = tmp;
-              curr_base->jump = r_end;
-              if (!prev_base) sel_ = curr_base;
-              else prev_base->jump = curr_base;
-            }
-          }
-          else left = left->next_in_sel;
+      //Runs are internally sorted, so an inversion can only exist between
+      //adjacent runs whose boundary is out of order. If no boundary inside
+      //any merge pair is out of order then merging is a no-op for this pass
+      //(the runs are already concatenated in place), so skip it.
+      bool any_inversion = false;
+      for (size_t run = width; run < edge_count; run += width << 1)
+      {
+        if (src[run - 1]->curr_x > src[run]->curr_x)
+        {
+          any_inversion = true;
+          break;
         }
-        prev_base = curr_base;
-        left = r_end;
       }
-      left = sel_;
+      if (!any_inversion)
+      {
+        //The array now consists of sorted runs of 2*width, but the
+        //boundaries between those runs haven't been checked yet, so only
+        //conclude that the array is fully sorted when they are in order too.
+        bool is_sorted = true;
+        for (size_t run = width << 1; run < edge_count; run += width << 1)
+        {
+          if (src[run - 1]->curr_x > src[run]->curr_x)
+          {
+            is_sorted = false;
+            break;
+          }
+        }
+        if (is_sorted) break;
+        continue;  //nb: no swap since the merge pass was a no-op (see above)
+      }
+
+      if (final_pass)
+      {
+        //final pass: the fully sorted array is never used, so only
+        //emit intersect nodes and don't bother materializing it.
+        const size_t mid = std::min(width, edge_count);
+        size_t left = 0, right = mid;
+        while (left < mid && right < edge_count)
+        {
+          if (src[right]->curr_x < src[left]->curr_x)
+          {
+            for (size_t k = mid; k-- > left; )
+              AddNewIntersectNode(*src[k], *src[right], top_y);
+            ++right;
+          }
+          else ++left;
+        }
+        break;
+      }
+
+      for (size_t run = 0; run < edge_count; run += width << 1)
+      {
+        const size_t mid = std::min(run + width, edge_count);
+        const size_t hi = std::min(run + (width << 1), edge_count);
+        if (mid == hi || src[mid - 1]->curr_x <= src[mid]->curr_x)
+        {
+          //these runs are already ordered relative to each other
+          memcpy(dst + run, src + run, (hi - run) * sizeof(Active*));
+          continue;
+        }
+        size_t left = run, right = mid, out = run;
+        while (left < mid && right < hi)
+        {
+          if (src[right]->curr_x < src[left]->curr_x)
+          {
+            //nb: nodes are added for the remaining left-run edges in
+            //reverse order, matching the original linked-list merge sort.
+            for (size_t k = mid; k-- > left; )
+              AddNewIntersectNode(*src[k], *src[right], top_y);
+            dst[out++] = src[right++];
+          }
+          else dst[out++] = src[left++];
+        }
+        while (left < mid) dst[out++] = src[left++];
+        while (right < hi) dst[out++] = src[right++];
+      }
+      std::swap(src, dst);
     }
     return intersect_nodes_.size() > 0;
   }
@@ -2442,7 +2586,7 @@ namespace Clipper2Lib {
     //crucial that intersections only occur between adjacent edges.
 
     //First we do a quicksort so intersections proceed in a bottom up order ...
-    std::sort(intersect_nodes_.begin(), intersect_nodes_.end(), IntersectListSort);
+    std::sort(intersect_nodes_.begin(), intersect_nodes_.end(), IntersectListSorter());
     //Now as we process these intersections, we must sometimes adjust the order
     //to ensure that intersecting edges are always adjacent ...
 
@@ -2718,8 +2862,9 @@ namespace Clipper2Lib {
             PushHorz(*e);  // horizontals are processed later
         }
       }
-      else // i.e. not the top of the edge
-        e->curr_x = TopX(*e, y);
+      //else curr_x is already correct (ie TopX(*e, y)) because it was
+      //updated in FillMergeArray() and, where necessary, restored
+      //after intersections were processed (see DoIntersections()).
 
       e = e->next_in_ael;
     }
@@ -2883,6 +3028,7 @@ namespace Clipper2Lib {
       return false;
 
     path.resize(0);
+    path.reserve(PointCount(op));
     Point64 lastPt;
     OutPt* op2;
     if (reverse)

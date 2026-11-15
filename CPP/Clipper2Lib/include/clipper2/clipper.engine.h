@@ -14,6 +14,11 @@
 #include <queue>
 #include <functional>
 #include <memory>
+#include <cstddef>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 namespace Clipper2Lib {
 
@@ -63,6 +68,10 @@ namespace Clipper2Lib {
 			next = this;
 			prev = this;
 		}
+
+		//nb: pooled allocation (see clipper.engine.cpp)
+		static void* operator new(std::size_t size);
+		static void operator delete(void* ptr) noexcept;
 	};
 
 	class PolyPath;
@@ -88,6 +97,10 @@ namespace Clipper2Lib {
 		Rect64 bounds = {};
 		Path64 path;
 		bool is_open = false;
+
+		//nb: pooled allocation (see clipper.engine.cpp)
+		static void* operator new(std::size_t size);
+		static void operator delete(void* ptr) noexcept;
 
 		~OutRec() {
 			if (splits) delete splits;
@@ -126,6 +139,10 @@ namespace Clipper2Lib {
 		LocalMinima* local_min = nullptr;  // the bottom of an edge 'bound' (also Vatti)
 		bool is_left_bound = false;
 		JoinWith join_with = JoinWith::NoJoin;
+
+		//nb: pooled allocation (see clipper.engine.cpp)
+		static void* operator new(std::size_t size);
+		static void operator delete(void* ptr) noexcept;
 	};
 
 	struct LocalMinima {
@@ -158,6 +175,76 @@ namespace Clipper2Lib {
 		OutPt* op2 = nullptr;
 		HorzJoin() {}
 		explicit HorzJoin(OutPt* ltr, OutPt* rtl) : op1(ltr), op2(rtl) { }
+	};
+
+	// ScanlineQueue ------------------------------------------------------------
+	// A monotone decreasing priority queue for scanline Y ordinates.
+	// Since every Y ordinate pushed after SetAnchor() is known not to exceed
+	// the anchor, ordinates close to the anchor are stored in a bitmap
+	// (making pushes and duplicate suppression O(1)), while ordinates that
+	// are too far below the anchor overflow into a conventional heap.
+
+	class ScanlineQueue {
+	private:
+		// nb: the bitmap covers up to 8M ordinates below the anchor (1MB)
+		static constexpr size_t max_words_ = 1 << 17;
+		std::vector<uint64_t> bits_;
+		std::priority_queue<int64_t> overflow_;
+		int64_t anchor_ = 0;
+		size_t curr_word_ = 0;
+	public:
+		void Clear()
+		{
+			std::fill(bits_.begin(), bits_.end(), 0);
+			curr_word_ = 0;
+			overflow_ = std::priority_queue<int64_t>();
+		}
+		void SetAnchor(int64_t max_y)
+		{
+			anchor_ = max_y;
+			curr_word_ = 0;
+		}
+		void Push(int64_t y)
+		{
+			//nb: unsigned subtraction is safe here because y <= anchor_
+			const uint64_t idx = static_cast<uint64_t>(anchor_) - static_cast<uint64_t>(y);
+			const uint64_t word = idx >> 6;
+			if (word < max_words_)
+			{
+				if (word >= bits_.size())
+				{
+					size_t new_size = bits_.size() ? bits_.size() : 64;
+					while (new_size <= word) new_size <<= 1;
+					bits_.resize(new_size, 0);
+				}
+				bits_[static_cast<size_t>(word)] |= (uint64_t(1) << (idx & 63));
+			}
+			else
+				overflow_.push(y);
+		}
+		bool Pop(int64_t& y)
+		{
+			while (curr_word_ < bits_.size() && !bits_[curr_word_]) ++curr_word_;
+			if (curr_word_ < bits_.size())
+			{
+				const uint64_t word = bits_[curr_word_];
+#ifdef _MSC_VER
+				unsigned long bit;
+				_BitScanForward64(&bit, word);
+#else
+				const int bit = __builtin_ctzll(word);
+#endif
+				y = anchor_ - static_cast<int64_t>((curr_word_ << 6) + bit);
+				bits_[curr_word_] = word & (word - 1);  //clear the lowest set bit
+				return true;
+			}
+			if (overflow_.empty()) return false;
+			y = overflow_.top();
+			overflow_.pop();
+			while (!overflow_.empty() && y == overflow_.top())
+				overflow_.pop();  //pop duplicates
+			return true;
+		}
 	};
 
 #ifdef USINGZ
@@ -202,8 +289,11 @@ namespace Clipper2Lib {
 		LocalMinimaList minima_list_;		//pointers in case of memory reallocs
 		LocalMinimaList::iterator current_locmin_iter_;
 		std::vector<Vertex*> vertex_lists_;
-		std::priority_queue<int64_t> scanline_list_;
+		ScanlineQueue scanline_list_;
 		IntersectNodeList intersect_nodes_;
+		std::vector<Active*> merge_arr_;
+		std::vector<Active*> merge_tmp_;
+		bool merge_sorted_ = false;
         HorzSegmentList horz_seg_list_;
 		std::vector<HorzJoin> horz_join_list_;
 		void Reset();
@@ -212,21 +302,20 @@ namespace Clipper2Lib {
 		inline bool PopLocalMinima(int64_t y, LocalMinima*& local_minima);
 		void DisposeAllOutRecs();
 		void DisposeVerticesAndLocalMinima();
-		void DeleteEdges(Active*& e);
 		inline void AddLocMin(Vertex &vert, PathType polytype, bool is_open);
 		bool IsContributingClosed(const Active &e) const;
 		inline bool IsContributingOpen(const Active &e) const;
 		void SetWindCountForClosedPathEdge(Active &edge);
 		void SetWindCountForOpenPathEdge(Active &e);
 		void InsertLocalMinimaIntoAEL(int64_t bot_y);
-		void InsertLeftEdge(Active &e);
+		void InsertLeftEdge(Active &e, Active* hint);
 		inline void PushHorz(Active &e);
 		inline bool PopHorz(Active *&e);
 		inline OutPt* StartOpenPath(Active &e, const Point64& pt);
 		inline void UpdateEdgeIntoAEL(Active *e);
 		void IntersectEdges(Active &e1, Active &e2, const Point64& pt);
 		inline void DeleteFromAEL(Active &e);
-		inline void AdjustCurrXAndCopyToSEL(const int64_t top_y);
+		inline void FillMergeArray(const int64_t top_y);
 		void DoIntersections(const int64_t top_y);
 		void AddNewIntersectNode(Active &e1, Active &e2, const int64_t top_y);
 		bool BuildIntersectList(const int64_t top_y);
