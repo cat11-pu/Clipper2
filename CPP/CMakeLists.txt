@@ -279,6 +279,7 @@ if(CLIPPER2_TESTS)
     Tests/TestRectClip.cpp
     Tests/TestSimplifyPath.cpp
     Tests/TestTrimCollinear.cpp
+    Tests/TestVariableOffset.cpp
     Tests/TestWindows.cpp
   )
 
@@ -316,6 +317,18 @@ if(CLIPPER2_TESTS)
   endif()
 
   set_target_properties(${CLIPPER2_TESTS} PROPERTIES FOLDER Tests)
+
+  if(NOT (CLIPPER2_USINGZ STREQUAL "ONLY"))
+    add_executable(VariableOffsetStress
+      Examples/VariableOffset/VariableOffsetStress.cpp)
+    target_link_libraries(VariableOffsetStress PRIVATE Clipper2)
+    set_target_properties(VariableOffsetStress PROPERTIES FOLDER Tests)
+
+    add_executable(VariableOffsetApi
+      Examples/VariableOffset/VariableOffsetApi.cpp)
+    target_link_libraries(VariableOffsetApi PRIVATE Clipper2)
+    set_target_properties(VariableOffsetApi PROPERTIES FOLDER Tests)
+  endif()
 
   file(COPY ../Tests/PolytreeHoleOwner.txt DESTINATION ${CMAKE_BINARY_DIR} FILE_PERMISSIONS OWNER_READ GROUP_READ WORLD_READ )
   file(COPY ../Tests/PolytreeHoleOwner2.txt DESTINATION ${CMAKE_BINARY_DIR} FILE_PERMISSIONS OWNER_READ GROUP_READ WORLD_READ )
