@@ -41,16 +41,25 @@ namespace Clipper2Lib
     "Invalid scale (either 0 or too large)";
   static const char* non_pair_error =
     "There must be 2 values for each coordinate";
+  static const char* degenerate_error =
+    "Degenerate path geometry";
+  static const char* intersection_error =
+    "Unstable near-collinear intersection";
   static const char* undefined_error =
     "There is an undefined error in Clipper2";
+  static const char* allocation_error =
+    "Input is too large to process safely";
 #endif
 
   // error codes (2^n)
   const int precision_error_i   = 1;  // non-fatal
   const int scale_error_i       = 2;  // non-fatal
   const int non_pair_error_i    = 4;  // non-fatal
+  const int degenerate_error_i  = 8;  // fatal
+  const int intersection_error_i = 16; // fatal
   const int undefined_error_i   = 32; // fatal
   const int range_error_i       = 64;
+  const int allocation_error_i  = 128; // fatal
 
 #ifndef PI
   static const double PI = 3.141592653589793238;
@@ -81,10 +90,16 @@ namespace Clipper2Lib
       throw Clipper2Exception(scale_error);
     case non_pair_error_i:
       throw Clipper2Exception(non_pair_error);
+    case degenerate_error_i:
+      throw Clipper2Exception(degenerate_error);
+    case intersection_error_i:
+      throw Clipper2Exception(intersection_error);
     case undefined_error_i:
       throw Clipper2Exception(undefined_error);
     case range_error_i:
       throw Clipper2Exception(range_error);
+    case allocation_error_i:
+      throw Clipper2Exception(allocation_error);
     // Should never happen, but adding this to stop a compiler warning
     default:
       throw Clipper2Exception("Unknown error");
@@ -699,6 +714,24 @@ namespace Clipper2Lib
     return (x > 0) - (x < 0); 
   }
 
+  template <typename T>
+  inline T SaturatingCoordCast(long double value, bool round_value)
+  {
+    if constexpr (std::is_integral_v<T>)
+    {
+      if (!std::isfinite(value))
+        return value < 0 ? MIN_COORD : MAX_COORD;
+      if (value <= static_cast<long double>(MIN_COORD)) return MIN_COORD;
+      if (value >= static_cast<long double>(MAX_COORD)) return MAX_COORD;
+      return static_cast<T>(round_value ? std::round(value) : value);
+    }
+    else
+    {
+      (void)round_value;
+      return static_cast<T>(value);
+    }
+  }
+
   struct UInt128Struct
   {
     const uint64_t lo = 0;
@@ -924,8 +957,10 @@ namespace Clipper2Lib
       double hitx = ((ln1dx * ln1c) - (ln2dx * ln0c)) / det;
       double hity = ((ln2dy * ln0c) - (ln1dy * ln1c)) / det;
 
-      ip.x = originx + (T)nearbyint(hitx);
-      ip.y = originy + (T)nearbyint(hity);
+      ip.x = SaturatingCoordCast<T>(
+        static_cast<long double>(originx) + hitx, true);
+      ip.y = SaturatingCoordCast<T>(
+        static_cast<long double>(originy) + hity, true);
     }
     else
     {
@@ -938,8 +973,10 @@ namespace Clipper2Lib
       double hitx = ((ln1dx * ln1c) - (ln2dx * ln0c)) / det;
       double hity = ((ln2dy * ln0c) - (ln1dy * ln1c)) / det;
 
-      ip.x = originx + static_cast<T>(hitx);
-      ip.y = originy + static_cast<T>(hity);
+      ip.x = SaturatingCoordCast<T>(
+        static_cast<long double>(originx) + hitx, false);
+      ip.y = SaturatingCoordCast<T>(
+        static_cast<long double>(originy) + hity, false);
     }
 #ifdef USINGZ
     ip.z = 0;
@@ -964,8 +1001,10 @@ namespace Clipper2Lib
     else if (t >= 1.0) ip = ln1b;
     else
     {
-      ip.x = static_cast<T>(ln1a.x + t * dx1);
-      ip.y = static_cast<T>(ln1a.y + t * dy1);
+      const double hit_x = static_cast<double>(ln1a.x) + t * dx1;
+      const double hit_y = static_cast<double>(ln1a.y) + t * dy1;
+      ip.x = SaturatingCoordCast<T>(hit_x, false);
+      ip.y = SaturatingCoordCast<T>(hit_y, false);
 #ifdef USINGZ
       ip.z = 0;
 #endif

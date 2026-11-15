@@ -265,6 +265,7 @@ if(CLIPPER2_TESTS)
   endif()
 
   set(ClipperTests_SRC
+    Tests/TestDegenerateInputs.cpp
     Tests/TestExportHeaders.cpp
     Tests/TestIsCollinear.cpp
     Tests/TestLines.cpp

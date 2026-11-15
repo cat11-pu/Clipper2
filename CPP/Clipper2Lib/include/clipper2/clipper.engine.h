@@ -31,6 +31,16 @@ namespace Clipper2Lib {
 	enum class PathType { Subject, Clip };
 	enum class JoinWith { NoJoin, Left, Right };
 
+	struct ClipperErrorInfo {
+		int code = 0;
+		Point64 location = InvalidPoint64;
+		PointD location_d = InvalidPointD;
+		bool has_location_d = false;
+		PathType path_type = PathType::Subject;
+		int path_index = -1;
+		int vertex_index = -1;
+	};
+
 	enum class VertexFlags : uint32_t {
 		Empty = 0, OpenStart = 1, OpenEnd = 2, LocalMax = 4, LocalMin = 8
 	};
@@ -228,7 +238,7 @@ namespace Clipper2Lib {
 		inline void DeleteFromAEL(Active &e);
 		inline void AdjustCurrXAndCopyToSEL(const int64_t top_y);
 		void DoIntersections(const int64_t top_y);
-		void AddNewIntersectNode(Active &e1, Active &e2, const int64_t top_y);
+		bool AddNewIntersectNode(Active &e1, Active &e2, const int64_t top_y);
 		bool BuildIntersectList(const int64_t top_y);
 		void ProcessIntersectList();
 		void SwapPositionsInAEL(Active& edge1, Active& edge2);
@@ -259,9 +269,20 @@ namespace Clipper2Lib {
 		bool preserve_collinear_ = true;
 		bool reverse_solution_ = false;
 		int error_code_ = 0;
+		ClipperErrorInfo error_info_;
 		bool has_open_paths_ = false;
 		bool succeeded_ = true;
 		OutRecList outrec_list_; //pointers in case list memory reallocated
+		bool ValidatePaths64(const Paths64& paths,
+			PathType polytype, bool is_open);
+		bool ValidatePathsD(const PathsD& paths, double scale,
+			PathType polytype, bool is_open);
+		void SetError(int code, const Point64& location,
+			PathType polytype = PathType::Subject,
+			int path_index = -1, int vertex_index = -1,
+			const PointD* location_d = nullptr);
+		void ClearError();
+		bool HasFatalError() const;
 		bool ExecuteInternal(ClipType ct, FillRule ft, bool use_polytrees);
 		void CleanCollinear(OutRec* outrec);
 		bool CheckBounds(OutRec* outrec);
@@ -277,6 +298,17 @@ namespace Clipper2Lib {
 	public:
 		virtual ~ClipperBase();
 		int ErrorCode() const { return error_code_; }
+		const ClipperErrorInfo& ErrorInfo() const { return error_info_; }
+		Point64 ErrorLocation() const { return error_info_.location; }
+		PointD ErrorLocationD() const
+		{
+			return error_info_.has_location_d ?
+				error_info_.location_d : PointD(error_info_.location);
+		}
+		int ErrorPathIndex() const { return error_info_.path_index; }
+		int ErrorVertexIndex() const { return error_info_.vertex_index; }
+		PathType ErrorPathType() const { return error_info_.path_type; }
+		const char* ErrorMessage() const;
 		void PreserveCollinear(bool val) { preserve_collinear_ = val; }
 		bool PreserveCollinear() const { return preserve_collinear_;}
 		void ReverseSolution(bool val) { reverse_solution_ = val; }
@@ -492,7 +524,9 @@ namespace Clipper2Lib {
 			closed_paths.clear();
 			open_paths.clear();
 			if (ExecuteInternal(clip_type, fill_rule, false))
-					BuildPaths64(closed_paths, &open_paths);
+			{
+				BuildPaths64(closed_paths, &open_paths);
+			}
 			CleanUp();
 			return succeeded_;
 		}
@@ -529,6 +563,7 @@ namespace Clipper2Lib {
 		explicit ClipperD(int precision = 2) : ClipperBase()
 		{
 			CheckPrecisionRange(precision, error_code_);
+			error_info_.code = error_code_;
 			// to optimize scaling / descaling precision
 			// set the scale to a power of double's radix (2) (#25)
 			scale_ = std::pow(std::numeric_limits<double>::radix,
@@ -572,17 +607,47 @@ namespace Clipper2Lib {
 
 		void AddSubject(const PathsD& subjects)
 		{
-			AddPaths(ScalePaths<int64_t, double>(subjects, scale_, error_code_), PathType::Subject, false);
+			if (HasFatalError() ||
+				!ValidatePathsD(subjects, scale_, PathType::Subject, false)) return;
+			AddPaths(ScalePaths<int64_t, double>(subjects, scale_, error_code_),
+				PathType::Subject, false);
+			if (HasFatalError() && !error_info_.has_location_d &&
+				error_info_.location != InvalidPoint64)
+			{
+				PointD loc = PointD(error_info_.location) * invScale_;
+				SetError(error_code_, error_info_.location, error_info_.path_type,
+					error_info_.path_index, error_info_.vertex_index, &loc);
+			}
 		}
 
 		void AddOpenSubject(const PathsD& open_subjects)
 		{
-			AddPaths(ScalePaths<int64_t, double>(open_subjects, scale_, error_code_), PathType::Subject, true);
+			if (HasFatalError() ||
+				!ValidatePathsD(open_subjects, scale_, PathType::Subject, true)) return;
+			AddPaths(ScalePaths<int64_t, double>(open_subjects, scale_, error_code_),
+				PathType::Subject, true);
+			if (HasFatalError() && !error_info_.has_location_d &&
+				error_info_.location != InvalidPoint64)
+			{
+				PointD loc = PointD(error_info_.location) * invScale_;
+				SetError(error_code_, error_info_.location, error_info_.path_type,
+					error_info_.path_index, error_info_.vertex_index, &loc);
+			}
 		}
 
 		void AddClip(const PathsD& clips)
 		{
-			AddPaths(ScalePaths<int64_t, double>(clips, scale_, error_code_), PathType::Clip, false);
+			if (HasFatalError() ||
+				!ValidatePathsD(clips, scale_, PathType::Clip, false)) return;
+			AddPaths(ScalePaths<int64_t, double>(clips, scale_, error_code_),
+				PathType::Clip, false);
+			if (HasFatalError() && !error_info_.has_location_d &&
+				error_info_.location != InvalidPoint64)
+			{
+				PointD loc = PointD(error_info_.location) * invScale_;
+				SetError(error_code_, error_info_.location, error_info_.path_type,
+					error_info_.path_index, error_info_.vertex_index, &loc);
+			}
 		}
 
 		bool Execute(ClipType clip_type, FillRule fill_rule, PathsD& closed_paths)

@@ -10,6 +10,8 @@
 #include "clipper2/clipper.engine.h"
 #include "clipper2/clipper.h"
 #include <stdexcept>
+#include <new>
+#include <limits>
 
 // https://github.com/AngusJohnson/Clipper2/discussions/334
 // #discussioncomment-4248602
@@ -24,6 +26,56 @@
 namespace Clipper2Lib {
 
   static const Rect64 invalid_rect = Rect64(false);
+
+  inline bool ProperSegmentsIntersect(const Point64& a, const Point64& b,
+    const Point64& c, const Point64& d)
+  {
+    const int o1 = CrossProductSign(a, b, c);
+    const int o2 = CrossProductSign(a, b, d);
+    const int o3 = CrossProductSign(c, d, a);
+    const int o4 = CrossProductSign(c, d, b);
+    return o1 != 0 && o2 != 0 && o3 != 0 && o4 != 0 &&
+      (o1 != o2) && (o3 != o4);
+  }
+
+  inline bool NearlyParallel(const Point64& a, const Point64& b,
+    const Point64& c, const Point64& d)
+  {
+    const long double dx1 = static_cast<long double>(b.x - a.x);
+    const long double dy1 = static_cast<long double>(b.y - a.y);
+    const long double dx2 = static_cast<long double>(d.x - c.x);
+    const long double dy2 = static_cast<long double>(d.y - c.y);
+    const long double len1_sq = dx1 * dx1 + dy1 * dy1;
+    const long double len2_sq = dx2 * dx2 + dy2 * dy2;
+    if (len1_sq == 0 || len2_sq == 0) return true;
+    const long double cross = dx1 * dy2 - dy1 * dx2;
+    return cross * cross <= 1e-28L * len1_sq * len2_sq;
+  }
+
+  inline bool WithinSegmentBounds(const Point64& pt,
+    const Point64& a, const Point64& b, int64_t pad)
+  {
+    return pt.x >= (std::min)(a.x, b.x) - pad &&
+      pt.x <= (std::max)(a.x, b.x) + pad &&
+      pt.y >= (std::min)(a.y, b.y) - pad &&
+      pt.y <= (std::max)(a.y, b.y) + pad;
+  }
+
+  inline int64_t RoundToInt64Saturated(double value)
+  {
+    if (!std::isfinite(value))
+      return value < 0 ? MIN_COORD : MAX_COORD;
+    if (value <= static_cast<double>(MIN_COORD)) return MIN_COORD;
+    if (value >= static_cast<double>(MAX_COORD)) return MAX_COORD;
+    return static_cast<int64_t>(nearbyint(value));
+  }
+
+  inline int64_t AddSaturated(int64_t a, int64_t b)
+  {
+    if (b > 0 && a > MAX_COORD - b) return MAX_COORD;
+    if (b < 0 && a < MIN_COORD - b) return MIN_COORD;
+    return a + b;
+  }
 
   // Every closed path (ie polygon) is made up of a series of vertices forming edge 
   // 'bounds' that alternate between ascending bounds (containing edges going up 
@@ -128,7 +180,8 @@ namespace Clipper2Lib {
   {
     if ((currentY == ae.top.y) || (ae.top.x == ae.bot.x)) return ae.top.x;
     else if (currentY == ae.bot.y) return ae.bot.x;
-    else return ae.bot.x + static_cast<int64_t>(nearbyint(ae.dx * (currentY - ae.bot.y)));
+    else return AddSaturated(ae.bot.x,
+      RoundToInt64Saturated(ae.dx * (currentY - ae.bot.y)));
     // nb: std::nearbyint (or std::round) substantially *improves* performance here
     // as it greatly improves the likelihood of edge adjacency in ProcessIntersectList().
   }
@@ -608,16 +661,33 @@ namespace Clipper2Lib {
     list.emplace_back(std::make_unique <LocalMinima>(&vert, polytype, is_open));
   }
 
-  void AddPaths_(const Paths64& paths, PathType polytype, bool is_open,
+  bool AddPaths_(const Paths64& paths, PathType polytype, bool is_open,
     std::vector<Vertex*>& vertexLists, LocalMinimaList& locMinList)
   {
-    const auto total_vertex_count =
-      std::accumulate(paths.begin(), paths.end(), size_t(0),
-        [](const auto& a, const Path64& path)
-        {return a + path.size(); });
-    if (total_vertex_count == 0) return;
+    const size_t max_vertices =
+      (std::numeric_limits<size_t>::max)() / sizeof(Vertex);
+    size_t total_vertex_count = 0;
+    for (const Path64& path : paths)
+    {
+      size_t compact_count = 0;
+      bool have_prev = false;
+      Point64 prev(0, 0);
+      for (const Point64& pt : path)
+      {
+        if (have_prev && pt == prev) continue;
+        prev = pt;
+        have_prev = true;
+        ++compact_count;
+      }
+      if (compact_count > max_vertices - total_vertex_count)
+        return false;
+      total_vertex_count += compact_count;
+    }
+    if (total_vertex_count == 0) return true;
 
-    Vertex* allVertices = new Vertex[total_vertex_count], * v = allVertices;
+    Vertex* allVertices =
+      new (std::nothrow) Vertex[total_vertex_count], * v = allVertices;
+    if (!allVertices) return false;
     for (const Path64& path : paths)
     {
       //for each path create a circular double linked list of vertices
@@ -710,6 +780,7 @@ namespace Clipper2Lib {
     } // end processing current path
 
     vertexLists.emplace_back(allVertices);
+    return true;
   }
 
   //------------------------------------------------------------------------------
@@ -752,6 +823,267 @@ namespace Clipper2Lib {
     Clear();
   }
 
+  void ClipperBase::SetError(int code, const Point64& location,
+    PathType polytype, int path_index, int vertex_index,
+    const PointD* location_d)
+  {
+    if (code == 0) return;
+    error_code_ |= code;
+    error_info_.code = error_code_;
+
+    const bool have_location = error_info_.location != InvalidPoint64 ||
+      error_info_.has_location_d;
+    if (!have_location && location != InvalidPoint64)
+    {
+      error_info_.location = location;
+      error_info_.path_type = polytype;
+      error_info_.path_index = path_index;
+      error_info_.vertex_index = vertex_index;
+      if (location_d)
+      {
+        error_info_.location_d = *location_d;
+        error_info_.has_location_d = true;
+      }
+    }
+    else if (location_d && !error_info_.has_location_d)
+    {
+      error_info_.location_d = *location_d;
+      error_info_.has_location_d = true;
+      error_info_.path_type = polytype;
+      error_info_.path_index = path_index;
+      error_info_.vertex_index = vertex_index;
+    }
+  }
+
+  void ClipperBase::ClearError()
+  {
+    error_code_ = 0;
+    error_info_ = ClipperErrorInfo();
+  }
+
+  bool ClipperBase::HasFatalError() const
+  {
+    const int fatal_mask = scale_error_i | degenerate_error_i |
+      intersection_error_i | undefined_error_i | range_error_i |
+      allocation_error_i;
+    return (error_code_ & fatal_mask) != 0;
+  }
+
+  const char* ClipperBase::ErrorMessage() const
+  {
+    if (error_code_ == 0) return "";
+    if (error_code_ & allocation_error_i) return allocation_error;
+    if (error_code_ & range_error_i) return range_error;
+    if (error_code_ & intersection_error_i) return intersection_error;
+    if (error_code_ & degenerate_error_i) return degenerate_error;
+    if (error_code_ & scale_error_i) return scale_error;
+    if (error_code_ & non_pair_error_i) return non_pair_error;
+    if (error_code_ & precision_error_i) return precision_error;
+    return undefined_error;
+  }
+
+  bool ClipperBase::ValidatePaths64(const Paths64& paths,
+    PathType polytype, bool is_open)
+  {
+    size_t normalized_total = 0;
+    const size_t max_vertices =
+      (std::numeric_limits<size_t>::max)() / sizeof(Vertex);
+
+    for (size_t path_idx = 0; path_idx < paths.size(); ++path_idx)
+    {
+      const Path64& path = paths[path_idx];
+      if (path.empty()) continue;
+
+      for (size_t vertex_idx = 0; vertex_idx < path.size(); ++vertex_idx)
+      {
+        const Point64& pt = path[vertex_idx];
+        if (pt.x < MIN_COORD || pt.x > MAX_COORD ||
+          pt.y < MIN_COORD || pt.y > MAX_COORD)
+        {
+          SetError(range_error_i, pt, polytype,
+            static_cast<int>(path_idx), static_cast<int>(vertex_idx));
+          return false;
+        }
+      }
+
+      size_t end = path.size();
+      if (!is_open)
+      {
+        while (end > 1 && path[end - 1] == path[0]) --end;
+      }
+
+      size_t distinct_count = 0;
+      size_t last_kept_idx = 0;
+      Point64 last_kept = path[0];
+      for (size_t vertex_idx = 0; vertex_idx < end; ++vertex_idx)
+      {
+        if (distinct_count > 0 && path[vertex_idx] == last_kept)
+          continue;
+        last_kept = path[vertex_idx];
+        last_kept_idx = vertex_idx;
+        ++distinct_count;
+      }
+
+      if ((is_open && distinct_count < 2) ||
+        (!is_open && distinct_count < 3))
+      {
+        const Point64 loc = end > 0 ? path[end - 1] : path[0];
+        SetError(degenerate_error_i, loc, polytype,
+          static_cast<int>(path_idx), static_cast<int>(last_kept_idx));
+        return false;
+      }
+      if (!is_open)
+      {
+        bool found_direction = false;
+        Point64 origin = path[0], direction(0, 0);
+        for (size_t vertex_idx = 1; vertex_idx < end; ++vertex_idx)
+        {
+          if (path[vertex_idx] == origin) continue;
+          direction = Point64(path[vertex_idx].x - origin.x,
+            path[vertex_idx].y - origin.y);
+          found_direction = true;
+          break;
+        }
+        if (found_direction)
+        {
+          for (size_t vertex_idx = 1; vertex_idx < end; ++vertex_idx)
+          {
+            if (path[vertex_idx] == origin) continue;
+            if (!ProductsAreEqual(direction.x,
+              path[vertex_idx].y - origin.y,
+              direction.y, path[vertex_idx].x - origin.x))
+            {
+              found_direction = false;
+              break;
+            }
+          }
+          if (found_direction)
+          {
+            SetError(degenerate_error_i, path[0], polytype,
+              static_cast<int>(path_idx), 0);
+            return false;
+          }
+        }
+      }
+
+      int64_t min_x = path[0].x, max_x = path[0].x;
+      int64_t min_y = path[0].y, max_y = path[0].y;
+      for (size_t vertex_idx = 1; vertex_idx < end; ++vertex_idx)
+      {
+        min_x = (std::min)(min_x, path[vertex_idx].x);
+        max_x = (std::max)(max_x, path[vertex_idx].x);
+        min_y = (std::min)(min_y, path[vertex_idx].y);
+        max_y = (std::max)(max_y, path[vertex_idx].y);
+      }
+      const long double span_x = static_cast<long double>(max_x) - min_x;
+      const long double span_y = static_cast<long double>(max_y) - min_y;
+      const long double span_sq = span_x * span_x + span_y * span_y;
+      if (span_sq > 0)
+      {
+        bool have_prev = false;
+        Point64 prev;
+        int prev_idx = -1;
+        for (size_t vertex_idx = 0; vertex_idx < end; ++vertex_idx)
+        {
+          const Point64& pt = path[vertex_idx];
+          if (have_prev && pt == prev) continue;
+          if (have_prev)
+          {
+            const long double dx =
+              static_cast<long double>(pt.x) - prev.x;
+            const long double dy =
+              static_cast<long double>(pt.y) - prev.y;
+            const long double len_sq = dx * dx + dy * dy;
+            if (len_sq > 0 && len_sq <= 4 &&
+              span_sq > 1e24L && len_sq < span_sq * 1e-24L)
+            {
+              SetError(degenerate_error_i, pt, polytype,
+                static_cast<int>(path_idx), static_cast<int>(vertex_idx));
+              return false;
+            }
+          }
+          prev = pt;
+          prev_idx = static_cast<int>(vertex_idx);
+          have_prev = true;
+        }
+        if (!is_open && have_prev && last_kept != path[0])
+        {
+          const long double dx =
+            static_cast<long double>(path[0].x) - prev.x;
+          const long double dy =
+            static_cast<long double>(path[0].y) - prev.y;
+          const long double len_sq = dx * dx + dy * dy;
+          if (len_sq > 0 && len_sq <= 4 &&
+            span_sq > 1e24L && len_sq < span_sq * 1e-24L)
+          {
+            SetError(degenerate_error_i, path[0], polytype,
+              static_cast<int>(path_idx), prev_idx);
+            return false;
+          }
+        }
+      }
+
+      if (distinct_count > max_vertices - normalized_total)
+      {
+        SetError(allocation_error_i, path[0], polytype,
+          static_cast<int>(path_idx), 0);
+        return false;
+      }
+      normalized_total += distinct_count;
+    }
+    return true;
+  }
+
+  bool ClipperBase::ValidatePathsD(const PathsD& paths, double scale,
+    PathType polytype, bool /*is_open*/)
+  {
+    if (!std::isfinite(scale) || scale <= 0)
+    {
+      SetError(scale_error_i, InvalidPoint64, polytype);
+      return false;
+    }
+
+    for (size_t path_idx = 0; path_idx < paths.size(); ++path_idx)
+    {
+      const PathD& path = paths[path_idx];
+      if (path.empty()) continue;
+
+      bool have_prev = false;
+      PointD prev_pt;
+      Point64 prev_rounded;
+      for (size_t vertex_idx = 0; vertex_idx < path.size(); ++vertex_idx)
+      {
+        const PointD& pt = path[vertex_idx];
+        const long double scaled_x =
+          static_cast<long double>(pt.x) * scale;
+        const long double scaled_y =
+          static_cast<long double>(pt.y) * scale;
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
+          !std::isfinite(scaled_x) || !std::isfinite(scaled_y) ||
+          scaled_x < min_coord || scaled_x > max_coord ||
+          scaled_y < min_coord || scaled_y > max_coord)
+        {
+          SetError(range_error_i, InvalidPoint64, polytype,
+            static_cast<int>(path_idx), static_cast<int>(vertex_idx), &pt);
+          return false;
+        }
+
+        Point64 rounded(static_cast<int64_t>(std::round(scaled_x)),
+          static_cast<int64_t>(std::round(scaled_y)));
+        if (have_prev && pt != prev_pt && rounded == prev_rounded)
+        {
+          SetError(degenerate_error_i, rounded, polytype,
+            static_cast<int>(path_idx), static_cast<int>(vertex_idx), &pt);
+          return false;
+        }
+        prev_pt = pt;
+        prev_rounded = rounded;
+        have_prev = true;
+      }
+    }
+    return true;
+  }
+
   void ClipperBase::DeleteEdges(Active*& e)
   {
     while (e)
@@ -777,6 +1109,7 @@ namespace Clipper2Lib {
   {
     CleanUp();
     DisposeVerticesAndLocalMinima();
+    ClearError();
     current_locmin_iter_ = minima_list_.begin();
     minima_list_sorted_ = false;
     has_open_paths_ = false;
@@ -835,9 +1168,16 @@ namespace Clipper2Lib {
 
   void ClipperBase::AddPaths(const Paths64& paths, PathType polytype, bool is_open)
   {
+    if (HasFatalError()) return;
+    if (!ValidatePaths64(paths, polytype, is_open)) return;
     if (is_open) has_open_paths_ = true;
     minima_list_sorted_ = false;
-    AddPaths_(paths, polytype, is_open, vertex_lists_, minima_list_);
+    if (!AddPaths_(paths, polytype, is_open, vertex_lists_, minima_list_))
+    {
+      SetError(allocation_error_i,
+        paths.empty() || paths[0].empty() ? InvalidPoint64 : paths[0][0],
+        polytype);
+    }
   }
 
   void ClipperBase::AddReuseableData(const ReuseableDataContainer64& reuseable_data)
@@ -1567,9 +1907,16 @@ namespace Clipper2Lib {
     OutPt* nextNextOp = splitOp->next->next;
     outrec->pts = prevOp;
 
-    Point64 ip;
-    GetLineIntersectPt(prevOp->pt, splitOp->pt,
-      splitOp->next->pt, nextNextOp->pt, ip);
+    Point64 ip(0, 0);
+    if (!GetLineIntersectPt(prevOp->pt, splitOp->pt,
+      splitOp->next->pt, nextNextOp->pt, ip))
+    {
+      const Point64 loc = splitOp->pt;
+      DisposeOutPts(outrec);
+      SetError(intersection_error_i, loc, PathType::Subject);
+      succeeded_ = false;
+      return;
+    }
 
 #ifdef USINGZ
     if (zCallback_) zCallback_(prevOp->pt, splitOp->pt,
@@ -2117,6 +2464,11 @@ namespace Clipper2Lib {
 
   bool ClipperBase::ExecuteInternal(ClipType ct, FillRule fillrule, bool use_polytrees)
   {
+    if (HasFatalError())
+    {
+      succeeded_ = false;
+      return false;
+    }
     cliptype_ = ct;
     fillrule_ = fillrule;
     using_polytree_ = use_polytrees;
@@ -2342,11 +2694,35 @@ namespace Clipper2Lib {
     }
   }
 
-  void ClipperBase::AddNewIntersectNode(Active& e1, Active& e2, int64_t top_y)
+  bool ClipperBase::AddNewIntersectNode(Active& e1, Active& e2, int64_t top_y)
   {
-    Point64 ip;
-    if (!GetLineIntersectPt(e1.bot, e1.top, e2.bot, e2.top, ip))
+    Point64 ip(0, 0);
+    const bool exact_crossing =
+      ProperSegmentsIntersect(e1.bot, e1.top, e2.bot, e2.top);
+    const bool has_line_intersection =
+      GetLineIntersectPt(e1.bot, e1.top, e2.bot, e2.top, ip);
+    if (!has_line_intersection)
+    {
+      if (exact_crossing)
+      {
+        const Point64 mid(
+          e1.bot.x + (e1.top.x - e1.bot.x) / 2,
+          e1.bot.y + (e1.top.y - e1.bot.y) / 2);
+        SetError(intersection_error_i, mid, GetPolyType(e1));
+        succeeded_ = false;
+        return false;
+      }
       ip = Point64(e1.curr_x, top_y); //parallel edges
+    }
+    else if (exact_crossing &&
+      (NearlyParallel(e1.bot, e1.top, e2.bot, e2.top) ||
+        !WithinSegmentBounds(ip, e1.bot, e1.top, 1) ||
+        !WithinSegmentBounds(ip, e2.bot, e2.top, 1)))
+    {
+      SetError(intersection_error_i, ip, GetPolyType(e1));
+      succeeded_ = false;
+      return false;
+    }
 
     //rounding errors can occasionally place the calculated intersection
     //point either below or above the scanbeam, so check and correct ...
@@ -2374,6 +2750,7 @@ namespace Clipper2Lib {
       }
     }
     intersect_nodes_.emplace_back(&e1, &e2, ip);
+    return true;
   }
 
   bool ClipperBase::BuildIntersectList(const int64_t top_y)
@@ -2407,7 +2784,8 @@ namespace Clipper2Lib {
             tmp = right->prev_in_sel;
             for (; ; )
             {
-              AddNewIntersectNode(*tmp, *right, top_y);
+              if (!AddNewIntersectNode(*tmp, *right, top_y))
+                return false;
               if (tmp == left) break;
               tmp = tmp->prev_in_sel;
             }
