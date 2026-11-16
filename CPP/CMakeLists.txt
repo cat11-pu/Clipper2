@@ -309,6 +309,12 @@ if(CLIPPER2_TESTS)
     )
   endif()
 
+  add_executable(RandomPolygonProperties
+    Tests/RandomPolygonProperties.cpp
+  )
+  target_link_libraries(RandomPolygonProperties PRIVATE Clipper2)
+  set_target_properties(RandomPolygonProperties PROPERTIES FOLDER Tests)
+
   if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     foreach(ts ${CLIPPER2_TESTS})
       target_compile_options(${ts} PRIVATE -Wno-unused-variable -Wno-unused-function)
