@@ -16,6 +16,7 @@
 #include "clipper2/clipper.rectclip.h"
 #include "clipper2/clipper.minkowski.h"
 #include "clipper2/clipper.triangulation.h"
+#include "clipper2/clipper.collision.h"
 #include <type_traits>
 
 namespace Clipper2Lib {

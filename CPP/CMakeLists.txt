@@ -43,6 +43,7 @@ set(CLIPPER2_INC
   ${CLIPPER2_INC_FOLDER}/clipper.h
   ${CLIPPER2_INC_FOLDER}/clipper.version.h
   ${CLIPPER2_INC_FOLDER}/clipper.core.h
+  ${CLIPPER2_INC_FOLDER}/clipper.collision.h
   ${CLIPPER2_INC_FOLDER}/clipper.engine.h
   ${CLIPPER2_INC_FOLDER}/clipper.export.h
   ${CLIPPER2_INC_FOLDER}/clipper.minkowski.h
@@ -53,6 +54,7 @@ set(CLIPPER2_INC
 
 set(CLIPPER2_SRC
   Clipper2Lib/src/clipper.engine.cpp
+  Clipper2Lib/src/clipper.collision.cpp
   Clipper2Lib/src/clipper.offset.cpp
   Clipper2Lib/src/clipper.rectclip.cpp
   Clipper2Lib/src/clipper.triangulation.cpp
@@ -266,6 +268,7 @@ if(CLIPPER2_TESTS)
 
   set(ClipperTests_SRC
     Tests/TestExportHeaders.cpp
+    Tests/TestCollisionContours.cpp
     Tests/TestIsCollinear.cpp
     Tests/TestLines.cpp
     Tests/TestOffsets.cpp

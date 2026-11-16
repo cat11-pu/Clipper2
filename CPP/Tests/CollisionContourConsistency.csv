@@ -1,0 +1,8 @@
+case,raw_in,normalized_in,out_vertices,contours,area_before,area_after,relative_error,effective_tolerance,unmapped,status,ms
+coincident,8,4,4,1,10000,10000,0,1,0,0,0
+hole,8,8,8,2,7500,7500,0,3,0,0,0
+rounded,3,3,3,1,4800,4800,0,1,0,0,0
+fallback,8,8,8,1,9900,9900,0,5,0,0,0
+square100k,100000,4,4,1,10000000000,10000000000,0,2,0,0,23
+circle100k,100000,75100,580,1,3141592663376,3141525549341,2.136306077563802e-05,20,0,0,56
+random1000,0,0,0,0,0,0,9.8344217942953255e-05,3.0,0,failures=0,33
